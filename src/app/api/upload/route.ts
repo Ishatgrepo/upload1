@@ -14,7 +14,7 @@ export async function POST(req: Request) {
 
     if (action === "init") {
       // Step 1: Call HF LFS Batch API to initialize multipart upload
-      const response = await fetch(`https://huggingface.co/api/datasets/${REPO_ID}/objects/batch`, {
+      const response = await fetch(`https://huggingface.co/datasets/${REPO_ID}.git/info/lfs/objects/batch`, {
         method: "POST",
         headers: {
           "Content-Type": "application/vnd.git-lfs+json",
