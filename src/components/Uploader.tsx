@@ -63,7 +63,7 @@ export default function Uploader() {
         prev.map((u) => (u.id === upload.id ? { ...u, status: "uploading" } : u))
       );
 
-      // Step 2: Initialize LFS Batch multipart request
+      // Step 2: Initialize LFS multipart request
       const initRes = await fetch("/api/upload", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -81,27 +81,26 @@ export default function Uploader() {
         return;
       }
 
-      // Handle either a single 'upload' URL (basic) or a list of parts (multipart)
-      // HF Batch returns multipart parts in an array under 'upload' for S3 multipart.
-      // Or it might be a single upload URL for basic transfer.
-      const uploadActions = Array.isArray(actions.upload) ? actions.upload : [actions.upload];
+      // HF returns upload actions for each part
+      const parts = Array.isArray(actions.upload) ? actions.upload : [actions.upload];
       const completeUrl = actions.complete?.href;
       const completeHeader = actions.complete?.header?.Authorization;
 
       let uploadedBytes = 0;
       const startUploadTime = Date.now();
 
-      for (let i = 0; i < uploadActions.length; i++) {
-        const action = uploadActions[i];
+      // Step 3: Sequential Chunk Uploads to the proxy
+      for (let i = 0; i < parts.length; i++) {
+        const action = parts[i];
         const start = i * CHUNK_SIZE;
         const end = Math.min(start + CHUNK_SIZE, file.size);
         const chunk = file.slice(start, end);
 
-        // Proxy part to HF-provided S3 URL
         const partRes = await fetch("/api/upload", {
           method: "PUT",
           headers: {
             "x-upload-url": action.href,
+            "x-upload-headers": JSON.stringify(action.header || {}),
             "Content-Type": "application/octet-stream",
           },
           body: await chunk.arrayBuffer(),
@@ -130,7 +129,7 @@ export default function Uploader() {
         );
       }
 
-      // Step 4: Complete multipart (if provided) and final Git Commit
+      // Step 4: Complete & Final Commit
       const commitRes = await fetch("/api/upload", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
