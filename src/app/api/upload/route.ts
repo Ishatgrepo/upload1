@@ -118,8 +118,9 @@ export async function PATCH(req: Request) {
       throw new Error(`Commit failed: ${err}`);
     }
 
-    const [username, repoName] = REPO_ID.split("/");
-    const downloadUrl = `https://huggingface.co/datasets/${username}/${repoName}/resolve/main/${filename}`;
+    const protocol = req.headers.get("x-forwarded-proto") || "http";
+    const host = req.headers.get("host");
+    const downloadUrl = `${protocol}://${host}/api/download/${filename}`;
 
     return NextResponse.json({ success: true, downloadUrl });
   } catch (error: any) {
