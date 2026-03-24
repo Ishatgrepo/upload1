@@ -23,18 +23,27 @@ export async function GET(
     });
 
     if (!response.ok) {
+      // If file not found or unauthorized
+      console.error(`Download failed: ${response.status} ${response.statusText} for ${hfUrl}`);
       return NextResponse.json({ error: "File not found or access denied" }, { status: response.status });
     }
 
-    // Pass along headers, set download disposition
-    const headers = new Headers(response.headers);
-    headers.set("Content-Disposition", `attachment; filename="${filename.split("-").slice(1).join("-")}"`);
+    // Strip unique prefix from filename for user display
+    // e.g., "1711246...-original-name.png" -> "original-name.png"
+    const originalFilename = filename.split("-").slice(1).join("-");
 
-    return new Response(response.body, {
+    const data = response.body;
+    const headers = new Headers(response.headers);
+
+    // Ensure it's treated as a download with the original filename
+    headers.set("Content-Disposition", `attachment; filename="${originalFilename}"`);
+
+    return new Response(data, {
       status: 200,
       headers,
     });
   } catch (error: any) {
+    console.error("Download proxy error:", error);
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }

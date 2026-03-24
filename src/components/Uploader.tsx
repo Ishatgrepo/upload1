@@ -63,7 +63,7 @@ export default function Uploader() {
         prev.map((u) => (u.id === upload.id ? { ...u, status: "uploading" } : u))
       );
 
-      // Step 2: Initialize multipart LFS
+      // Step 2: Initialize LFS Batch multipart request
       const initRes = await fetch("/api/upload", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -81,15 +81,12 @@ export default function Uploader() {
         return;
       }
 
-      // Handle basic transfer or multipart
-      // Basic transfer will have one 'upload' action.
-      // Multipart transfer will have an 'upload' action that is a list of parts,
-      // or a separate 'parts' list.
-      // HF's Batch API for multipart returns 'upload' actions for EACH PART if using basic transfers.
-      // But we requested 'multipart'.
-
+      // Handle either a single 'upload' URL (basic) or a list of parts (multipart)
+      // HF Batch returns multipart parts in an array under 'upload' for S3 multipart.
+      // Or it might be a single upload URL for basic transfer.
       const uploadActions = Array.isArray(actions.upload) ? actions.upload : [actions.upload];
       const completeUrl = actions.complete?.href;
+      const completeHeader = actions.complete?.header?.Authorization;
 
       let uploadedBytes = 0;
       const startUploadTime = Date.now();
@@ -133,7 +130,7 @@ export default function Uploader() {
         );
       }
 
-      // Step 4: Complete & Final Git Commit
+      // Step 4: Complete multipart (if provided) and final Git Commit
       const commitRes = await fetch("/api/upload", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
@@ -143,11 +140,12 @@ export default function Uploader() {
           uniqueFilename,
           sha256,
           size: file.size,
-          completeUrl
+          completeUrl,
+          completeHeader
         }),
       });
 
-      if (!commitRes.ok) throw new Error("Commit failed");
+      if (!commitRes.ok) throw new Error("Finalization failed");
       const { downloadUrl } = await commitRes.json();
 
       setUploads((prev) =>
