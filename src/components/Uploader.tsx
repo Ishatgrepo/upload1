@@ -19,7 +19,6 @@ interface FileProgress {
   startTime: number;
 }
 
-// Full-file SHA-256 (required by LFS)
 async function computeSHA256(file: File): Promise<string> {
   const buffer = await file.arrayBuffer();
   const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
@@ -53,17 +52,12 @@ export default function Uploader() {
 
   const startUpload = async (upload: FileProgress) => {
     const file = upload.file;
-    const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB
+    const CHUNK_SIZE = 4 * 1024 * 1024;
 
     try {
-      // Step 1: Compute full-file checksum
       const sha256 = await computeSHA256(file);
+      setUploads((prev) => prev.map((u) => (u.id === upload.id ? { ...u, status: "uploading" } : u)));
 
-      setUploads((prev) =>
-        prev.map((u) => (u.id === upload.id ? { ...u, status: "uploading" } : u))
-      );
-
-      // Step 2: Initialize LFS multipart request
       const initRes = await fetch("/api/upload", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -73,91 +67,63 @@ export default function Uploader() {
       if (!initRes.ok) throw new Error("Initialization failed");
       const { actions, uniqueFilename } = await initRes.json();
 
-      // If already uploaded, object will have 'actions' but maybe not 'upload'
       if (!actions?.upload) {
-        setUploads((prev) =>
-          prev.map((u) => u.id === upload.id ? { ...u, status: "completed", progress: 100 } : u)
-        );
+        setUploads((prev) => prev.map((u) => (u.id === upload.id ? { ...u, status: "completed", progress: 100 } : u)));
         return;
       }
 
-      // HF returns upload actions for each part
-      const parts = Array.isArray(actions.upload) ? actions.upload : [actions.upload];
-      const completeUrl = actions.complete?.href;
-      const completeHeader = actions.complete?.header?.Authorization;
+      const uploadAction = actions.upload;
+      const completeUrl = uploadAction.href.includes("complete_multipart") ? uploadAction.href : undefined;
+      const verifyUrl = actions.verify?.href;
 
       let uploadedBytes = 0;
       const startUploadTime = Date.now();
+      const totalParts = Math.ceil(file.size / CHUNK_SIZE);
 
-      // Step 3: Sequential Chunk Uploads to the proxy
-      for (let i = 0; i < parts.length; i++) {
-        const action = parts[i];
-        const start = i * CHUNK_SIZE;
+      for (let i = 1; i <= totalParts; i++) {
+        const partKey = i.toString().padStart(5, '0');
+        const partUrl = uploadAction.header?.[partKey] || uploadAction.href;
+        const start = (i - 1) * CHUNK_SIZE;
         const end = Math.min(start + CHUNK_SIZE, file.size);
         const chunk = file.slice(start, end);
 
         const partRes = await fetch("/api/upload", {
           method: "PUT",
-          headers: {
-            "x-upload-url": action.href,
-            "x-upload-headers": JSON.stringify(action.header || {}),
-            "Content-Type": "application/octet-stream",
-          },
+          headers: { "x-upload-url": partUrl, "Content-Type": "application/octet-stream" },
           body: await chunk.arrayBuffer(),
         });
 
-        if (!partRes.ok) throw new Error(`Part ${i+1} failed to upload`);
+        if (!partRes.ok) throw new Error(`Part ${i} failed`);
 
         uploadedBytes = end;
-        const now = Date.now();
-        const elapsed = (now - startUploadTime) / 1000;
+        const elapsed = (Date.now() - startUploadTime) / 1000;
         const speed = uploadedBytes / elapsed;
-        const remainingBytes = file.size - uploadedBytes;
-        const eta = remainingBytes / speed;
+        const eta = (file.size - uploadedBytes) / speed;
 
-        setUploads((prev) =>
-          prev.map((u) =>
-            u.id === upload.id
-              ? {
-                  ...u,
-                  progress: Math.round((uploadedBytes / file.size) * 100),
-                  speed,
-                  eta,
-                }
-              : u
-          )
-        );
+        setUploads((prev) => prev.map((u) => u.id === upload.id ? { ...u, progress: Math.round((uploadedBytes / file.size) * 100), speed, eta } : u));
       }
 
-      // Step 4: Complete & Final Commit
+      if (verifyUrl) {
+        const verRes = await fetch("/api/upload", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "verify", verifyUrl, sha256, size: file.size }),
+        });
+        if (!verRes.ok) throw new Error("Verification failed");
+      }
+
       const commitRes = await fetch("/api/upload", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: "complete",
-          filename: file.name,
-          uniqueFilename,
-          sha256,
-          size: file.size,
-          completeUrl,
-          completeHeader
-        }),
+        body: JSON.stringify({ action: "complete", filename: file.name, uniqueFilename, sha256, size: file.size, completeUrl }),
       });
 
-      if (!commitRes.ok) throw new Error("Finalization failed");
+      if (!commitRes.ok) throw new Error("Commit failed");
       const { downloadUrl } = await commitRes.json();
 
-      setUploads((prev) =>
-        prev.map((u) =>
-          u.id === upload.id ? { ...u, status: "completed", downloadUrl, progress: 100 } : u
-        )
-      );
+      setUploads((prev) => prev.map((u) => u.id === upload.id ? { ...u, status: "completed", downloadUrl, progress: 100 } : u));
     } catch (error: any) {
-      setUploads((prev) =>
-        prev.map((u) =>
-          u.id === upload.id ? { ...u, status: "error", errorMessage: error.message } : u
-        )
-      );
+      setUploads((prev) => prev.map((u) => u.id === upload.id ? { ...u, status: "error", errorMessage: error.message } : u));
     }
   };
 
@@ -169,111 +135,33 @@ export default function Uploader() {
 
   return (
     <div className="w-full max-w-4xl mx-auto p-6 space-y-8">
-      {/* Dropzone */}
-      <div
-        {...getRootProps()}
-        className={cn(
-          "relative group cursor-pointer rounded-3xl border-2 border-dashed transition-all duration-300 ease-in-out p-12 flex flex-col items-center justify-center space-y-4",
-          isDragActive
-            ? "border-blue-500 bg-blue-50/50 scale-[0.99]"
-            : "border-gray-200 hover:border-gray-300 hover:bg-gray-50/50"
-        )}
-      >
+      <div {...getRootProps()} className={cn("relative group cursor-pointer rounded-3xl border-2 border-dashed transition-all duration-300 ease-in-out p-12 flex flex-col items-center justify-center space-y-4", isDragActive ? "border-blue-500 bg-blue-50/50 scale-[0.99]" : "border-gray-200 hover:border-gray-300 hover:bg-gray-50/50")}>
         <input {...getInputProps()} />
-        <div className="w-16 h-16 bg-blue-500 text-white rounded-2xl flex items-center justify-center shadow-lg group-hover:scale-110 transition-transform duration-300">
-          <Upload className="w-8 h-8" />
-        </div>
-        <div className="text-center">
-          <h3 className="text-xl font-semibold text-gray-800">Drop files here</h3>
-          <p className="text-gray-500 mt-1">or click to browse from your computer</p>
-        </div>
+        <div className="w-16 h-16 bg-blue-500 text-white rounded-2xl flex items-center justify-center shadow-lg group-hover:scale-110 transition-transform duration-300"><Upload className="w-8 h-8" /></div>
+        <div className="text-center"><h3 className="text-xl font-semibold text-gray-800">Drop files here</h3><p className="text-gray-500 mt-1">or click to browse from your computer</p></div>
       </div>
-
-      {/* Progress Cards */}
       <div className="space-y-4">
         <AnimatePresence initial={false}>
           {uploads.map((upload) => (
-            <motion.div
-              key={upload.id}
-              initial={{ opacity: 0, y: 20 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.95 }}
-              className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm hover:shadow-md transition-shadow duration-300"
-            >
+            <motion.div key={upload.id} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, scale: 0.95 }} className="bg-white rounded-2xl border border-gray-100 p-5 shadow-sm hover:shadow-md transition-shadow duration-300">
               <div className="flex items-start gap-4">
                 <div className="flex-shrink-0">{getFileIcon(upload.file.type)}</div>
-
                 <div className="flex-grow min-w-0">
-                  <div className="flex items-center justify-between mb-1">
-                    <h4 className="font-medium text-gray-900 truncate pr-4">
-                      {upload.file.name}
-                    </h4>
-                    <span className="text-xs font-medium text-gray-400 whitespace-nowrap">
-                      {formatBytes(upload.file.size)}
-                    </span>
-                  </div>
-
+                  <div className="flex items-center justify-between mb-1"><h4 className="font-medium text-gray-900 truncate pr-4">{upload.file.name}</h4><span className="text-xs font-medium text-gray-400 whitespace-nowrap">{formatBytes(upload.file.size)}</span></div>
                   <div className="flex items-center gap-4 text-xs text-gray-500 mb-3">
-                    {upload.status === "hashing" && (
-                      <span className="animate-pulse text-blue-600 font-medium">Computing checksum...</span>
-                    )}
-                    {upload.status === "uploading" && (
-                      <>
-                        <span className="flex items-center gap-1">
-                          {formatBytes(upload.speed)}/s
-                        </span>
-                        <span>•</span>
-                        <span>{formatDuration(upload.eta)}</span>
-                      </>
-                    )}
-                    {upload.status === "completed" && (
-                      <span className="text-green-600 font-medium flex items-center gap-1">
-                        <CheckCircle2 className="w-3 h-3" /> Upload complete
-                      </span>
-                    )}
-                    {upload.status === "error" && (
-                      <span className="text-red-500 font-medium flex items-center gap-1">
-                        <AlertCircle className="w-3 h-3" /> {upload.errorMessage || "Upload failed"}
-                      </span>
-                    )}
+                    {upload.status === "hashing" && <span className="animate-pulse text-blue-600 font-medium">Computing checksum...</span>}
+                    {upload.status === "uploading" && <><span className="flex items-center gap-1">{formatBytes(upload.speed)}/s</span><span>•</span><span>{formatDuration(upload.eta)}</span></>}
+                    {upload.status === "completed" && <span className="text-green-600 font-medium flex items-center gap-1"><CheckCircle2 className="w-3 h-3" /> Upload complete</span>}
+                    {upload.status === "error" && <span className="text-red-500 font-medium flex items-center gap-1"><AlertCircle className="w-3 h-3" /> {upload.errorMessage || "Upload failed"}</span>}
                   </div>
-
-                  {/* Progress Bar */}
                   <div className="relative h-2 bg-gray-100 rounded-full overflow-hidden">
-                    <motion.div
-                      className={cn(
-                        "absolute top-0 left-0 h-full rounded-full transition-colors duration-300",
-                        upload.status === "error" ? "bg-red-500" : "bg-blue-500"
-                      )}
-                      initial={{ width: 0 }}
-                      animate={{ width: `${upload.progress}%` }}
-                      transition={{ duration: 0.5 }}
-                    />
+                    <motion.div className={cn("absolute top-0 left-0 h-full rounded-full transition-colors duration-300", upload.status === "error" ? "bg-red-500" : "bg-blue-500")} initial={{ width: 0 }} animate={{ width: `${upload.progress}%` }} transition={{ duration: 0.5 }} />
                   </div>
                 </div>
-
                 {upload.status === "completed" && upload.downloadUrl && (
                   <div className="flex-shrink-0 pl-2">
-                    <button
-                      onClick={() => copyToClipboard(upload.downloadUrl!, upload.id)}
-                      className={cn(
-                        "p-2.5 rounded-xl transition-all duration-200 flex items-center gap-2",
-                        copiedId === upload.id
-                          ? "bg-green-50 text-green-600"
-                          : "bg-gray-50 text-gray-600 hover:bg-gray-100"
-                      )}
-                    >
-                      {copiedId === upload.id ? (
-                        <>
-                          <CheckCircle2 className="w-5 h-5" />
-                          <span className="text-sm font-medium">Copied</span>
-                        </>
-                      ) : (
-                        <>
-                          <Copy className="w-5 h-5" />
-                          <span className="text-sm font-medium">Copy Link</span>
-                        </>
-                      )}
+                    <button onClick={() => copyToClipboard(upload.downloadUrl!, upload.id)} className={cn("p-2.5 rounded-xl transition-all duration-200 flex items-center gap-2", copiedId === upload.id ? "bg-green-50 text-green-600" : "bg-gray-50 text-gray-600 hover:bg-gray-100")}>
+                      {copiedId === upload.id ? <><CheckCircle2 className="w-5 h-5" /><span className="text-sm font-medium">Copied</span></> : <><Copy className="w-5 h-5" /><span className="text-sm font-medium">Copy Link</span></>}
                     </button>
                   </div>
                 )}

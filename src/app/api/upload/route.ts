@@ -3,6 +3,32 @@ import { NextResponse } from "next/server";
 const HF_TOKEN = process.env.HF_TOKEN;
 const REPO_ID = process.env.REPO_ID || "";
 
+async function getUniqueFilename(filename: string): Promise<string> {
+  // Fetch dataset info to check existing files
+  const res = await fetch(`https://huggingface.co/api/datasets/${REPO_ID}/tree/main`, {
+    headers: { Authorization: `Bearer ${HF_TOKEN}` },
+  });
+
+  if (!res.ok) return filename; // Fallback
+
+  const files = await res.json();
+  const existingNames = new Set(files.map((f: any) => f.path));
+
+  if (!existingNames.has(filename)) return filename;
+
+  const dotIndex = filename.lastIndexOf(".");
+  const name = dotIndex !== -1 ? filename.substring(0, dotIndex) : filename;
+  const ext = dotIndex !== -1 ? filename.substring(dotIndex) : "";
+
+  let counter = 1;
+  let newName = `${name} (${counter})${ext}`;
+  while (existingNames.has(newName)) {
+    counter++;
+    newName = `${name} (${counter})${ext}`;
+  }
+  return newName;
+}
+
 export async function POST(req: Request) {
   if (!HF_TOKEN || !REPO_ID) {
     return NextResponse.json({ error: "HF_TOKEN or REPO_ID not configured" }, { status: 500 });
@@ -13,17 +39,16 @@ export async function POST(req: Request) {
     const { action, filename, size, sha256 } = body;
 
     if (action === "init") {
-      const uniqueFilename = `${Date.now()}-${filename}`;
+      // Step 1: Resolve unique filename (e.g., file (1).txt)
+      const uniqueFilename = await getUniqueFilename(filename);
 
-      // Calculate part sizes for multipart (approx 4MB each)
-      // Vercel limit is 4.5MB, so 4MB is safe.
+      // Step 2: LFS Batch Request
       const CHUNK_SIZE = 4 * 1024 * 1024;
       const totalParts = Math.ceil(size / CHUNK_SIZE);
       const parts = Array.from({ length: totalParts }, (_, i) => ({
         size: i === totalParts - 1 ? size - i * CHUNK_SIZE : CHUNK_SIZE,
       }));
 
-      // LFS Batch Request with 'multipart' transfer
       const response = await fetch(`https://huggingface.co/datasets/${REPO_ID}.git/info/lfs/objects/batch`, {
         method: "POST",
         headers: {
@@ -33,7 +58,7 @@ export async function POST(req: Request) {
         },
         body: JSON.stringify({
           operation: "upload",
-          transfers: ["multipart"],
+          transfers: ["multipart", "basic"],
           ref: { name: "refs/heads/main" },
           objects: [{ oid: sha256, size, parts }],
         }),
@@ -51,12 +76,25 @@ export async function POST(req: Request) {
         throw new Error(`HF LFS Object error: ${object.error.message}`);
       }
 
-      // If object.actions is missing, file might already exist on HF
       return NextResponse.json({
         success: true,
         actions: object.actions,
         uniqueFilename
       });
+    }
+
+    if (action === "verify") {
+      const { verifyUrl, sha256, size } = body;
+      const response = await fetch(verifyUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/vnd.git-lfs+json",
+          "Authorization": `Bearer ${HF_TOKEN}`,
+        },
+        body: JSON.stringify({ oid: sha256, size }),
+      });
+      if (!response.ok) throw new Error("Verification failed");
+      return NextResponse.json({ success: true });
     }
 
     return NextResponse.json({ error: "Invalid action" }, { status: 400 });
@@ -68,57 +106,34 @@ export async function POST(req: Request) {
 
 export async function PUT(req: Request) {
   const url = req.headers.get("x-upload-url");
-  const encodedHeaders = req.headers.get("x-upload-headers");
-
   if (!url) return NextResponse.json({ error: "Missing upload URL" }, { status: 400 });
-
   try {
-    const headers = encodedHeaders ? JSON.parse(encodedHeaders) : {};
     const body = await req.arrayBuffer();
-
-    // Forward the chunk to S3 with the signed headers provided by HF
-    const response = await fetch(url, {
-      method: "PUT",
-      headers,
-      body,
-    });
-
-    if (!response.ok) {
-      const err = await response.text();
-      throw new Error(`S3 part upload failed: ${response.status} ${err}`);
-    }
-
+    const response = await fetch(url, { method: "PUT", body });
+    if (!response.ok) throw new Error(`S3 upload failed: ${response.statusText}`);
     return NextResponse.json({ success: true });
   } catch (error: any) {
-    console.error("S3 Proxy error:", error);
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }
 
 export async function PATCH(req: Request) {
   const body = await req.json();
-  const { action, filename, uniqueFilename, sha256, size, completeUrl, completeHeader } = body;
+  const { action, filename, uniqueFilename, sha256, size, completeUrl } = body;
 
   try {
     if (action === "complete") {
-      // 1. Complete the LFS multipart upload if the API provided a 'complete' action
       if (completeUrl) {
-        const res = await fetch(completeUrl, {
+        await fetch(completeUrl, {
           method: "POST",
           headers: {
-            "Authorization": completeHeader || `Bearer ${HF_TOKEN}`,
+            "Authorization": `Bearer ${HF_TOKEN}`,
             "Content-Type": "application/json",
           },
           body: JSON.stringify({}),
         });
-        if (!res.ok) {
-          const err = await res.text();
-          throw new Error(`LFS Complete failed: ${err}`);
-        }
       }
 
-      // 2. Final Git Commit with the LFS pointer content
-      // The content of a Git LFS file is just a pointer to the actual LFS object.
       const pointerContent = `version https://git-lfs.github.com/spec/v1\noid sha256:${sha256}\nsize ${size}\n`;
 
       const commitRes = await fetch(`https://huggingface.co/api/datasets/${REPO_ID}/commit/main`, {
@@ -128,11 +143,11 @@ export async function PATCH(req: Request) {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          summary: `Upload ${filename}`,
+          summary: `Upload ${uniqueFilename}`,
           operations: [
             {
               action: "add",
-              path: uniqueFilename,
+              path: uniqueFilename, // Standard readable filename
               content: Buffer.from(pointerContent).toString("base64"),
               encoding: "base64",
             },
@@ -140,10 +155,7 @@ export async function PATCH(req: Request) {
         }),
       });
 
-      if (!commitRes.ok) {
-        const err = await commitRes.text();
-        throw new Error(`Git Commit failed: ${err}`);
-      }
+      if (!commitRes.ok) throw new Error(`Git Commit failed: ${await commitRes.text()}`);
 
       const protocol = req.headers.get("x-forwarded-proto") || "http";
       const host = req.headers.get("host");
@@ -154,7 +166,6 @@ export async function PATCH(req: Request) {
 
     return NextResponse.json({ error: "Invalid action" }, { status: 400 });
   } catch (error: any) {
-    console.error("Finalization error:", error);
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }
