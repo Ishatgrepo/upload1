@@ -1,0 +1,13 @@
+
+> clouddrive@1.0.0 dev
+> next dev
+
+▲ Next.js 16.2.1 (Turbopack)
+- Local:         http://localhost:3000
+- Network:       http://192.168.0.2:3000
+✓ Ready in 576ms
+
+○ Compiling / ...
+ GET / 200 in 9.0s (next.js: 8.4s, application-code: 625ms)
+ GET / 200 in 87ms (next.js: 5ms, application-code: 81ms)
+ GET / 200 in 284ms (next.js: 21ms, application-code: 263ms)
