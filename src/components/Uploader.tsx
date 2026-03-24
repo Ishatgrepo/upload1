@@ -19,7 +19,7 @@ interface FileProgress {
   startTime: number;
 }
 
-// Helper to compute SHA-256 using the Web Crypto API
+// Full-file SHA-256 (required by LFS)
 async function computeSHA256(file: File): Promise<string> {
   const buffer = await file.arrayBuffer();
   const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
@@ -52,58 +52,65 @@ export default function Uploader() {
   });
 
   const startUpload = async (upload: FileProgress) => {
-    const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB
     const file = upload.file;
-    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    const CHUNK_SIZE = 4 * 1024 * 1024; // 4MB
 
     try {
-      // Step 1: Compute Hash
+      // Step 1: Compute full-file checksum
       const sha256 = await computeSHA256(file);
 
       setUploads((prev) =>
         prev.map((u) => (u.id === upload.id ? { ...u, status: "uploading" } : u))
       );
 
-      // Step 2: Init LFS (Batch API)
+      // Step 2: Initialize multipart LFS
       const initRes = await fetch("/api/upload", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "init", filename: file.name, size: file.size, sha256 }),
       });
 
-      if (!initRes.ok) throw new Error("Failed to initialize LFS Batch");
-      const { actions } = await initRes.json();
+      if (!initRes.ok) throw new Error("Initialization failed");
+      const { actions, uniqueFilename } = await initRes.json();
 
-      // If the file already exists, it might skip actions or error out.
-      // For this demo, we assume the upload is required.
-      const uploadAction = actions.upload;
-      if (!uploadAction) {
-        // Handle existing file
+      // If already uploaded, object will have 'actions' but maybe not 'upload'
+      if (!actions?.upload) {
         setUploads((prev) =>
           prev.map((u) => u.id === upload.id ? { ...u, status: "completed", progress: 100 } : u)
         );
         return;
       }
 
-      // Step 3: Sequential Chunk Uploads (Proxy via API)
+      // Handle basic transfer or multipart
+      // Basic transfer will have one 'upload' action.
+      // Multipart transfer will have an 'upload' action that is a list of parts,
+      // or a separate 'parts' list.
+      // HF's Batch API for multipart returns 'upload' actions for EACH PART if using basic transfers.
+      // But we requested 'multipart'.
+
+      const uploadActions = Array.isArray(actions.upload) ? actions.upload : [actions.upload];
+      const completeUrl = actions.complete?.href;
+
       let uploadedBytes = 0;
       const startUploadTime = Date.now();
 
-      for (let i = 0; i < totalChunks; i++) {
+      for (let i = 0; i < uploadActions.length; i++) {
+        const action = uploadActions[i];
         const start = i * CHUNK_SIZE;
         const end = Math.min(start + CHUNK_SIZE, file.size);
         const chunk = file.slice(start, end);
 
-        const chunkRes = await fetch("/api/upload", {
+        // Proxy part to HF-provided S3 URL
+        const partRes = await fetch("/api/upload", {
           method: "PUT",
           headers: {
-            "x-upload-url": uploadAction.href, // Proxying directly to HF LFS upload link for simplicity
+            "x-upload-url": action.href,
             "Content-Type": "application/octet-stream",
           },
           body: await chunk.arrayBuffer(),
         });
 
-        if (!chunkRes.ok) throw new Error(`Chunk ${i+1} failed`);
+        if (!partRes.ok) throw new Error(`Part ${i+1} failed to upload`);
 
         uploadedBytes = end;
         const now = Date.now();
@@ -126,11 +133,18 @@ export default function Uploader() {
         );
       }
 
-      // Step 4: Final Commit
+      // Step 4: Complete & Final Git Commit
       const commitRes = await fetch("/api/upload", {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filename: file.name, sha256, size: file.size }),
+        body: JSON.stringify({
+          action: "complete",
+          filename: file.name,
+          uniqueFilename,
+          sha256,
+          size: file.size,
+          completeUrl
+        }),
       });
 
       if (!commitRes.ok) throw new Error("Commit failed");

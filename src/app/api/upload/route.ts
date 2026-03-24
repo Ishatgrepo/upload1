@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 
 const HF_TOKEN = process.env.HF_TOKEN;
-const REPO_ID = process.env.REPO_ID || ""; // Format: USER/REPO
+const REPO_ID = process.env.REPO_ID || "";
 
 export async function POST(req: Request) {
   if (!HF_TOKEN || !REPO_ID) {
@@ -10,10 +10,13 @@ export async function POST(req: Request) {
 
   try {
     const body = await req.json();
-    const { action, filename, size, sha256, parts, uploadUrl } = body;
+    const { action, filename, size, sha256 } = body;
 
     if (action === "init") {
-      // Step 1: Call HF LFS Batch API to initialize multipart upload
+      // Create a unique filename to prevent overwriting
+      const uniqueFilename = `${Date.now()}-${filename}`;
+
+      // Step 1: Request MULTIPART transfer from LFS Batch API
       const response = await fetch(`https://huggingface.co/datasets/${REPO_ID}.git/info/lfs/objects/batch`, {
         method: "POST",
         headers: {
@@ -23,7 +26,7 @@ export async function POST(req: Request) {
         },
         body: JSON.stringify({
           operation: "upload",
-          transfers: ["basic"],
+          transfers: ["multipart"],
           ref: { name: "refs/heads/main" },
           objects: [{ oid: sha256, size }],
         }),
@@ -41,22 +44,12 @@ export async function POST(req: Request) {
         throw new Error(`HF LFS Object error: ${object.error.message}`);
       }
 
-      // If already uploaded, object will have 'actions' but maybe not 'upload'
-      // For multipart, HF returns a list of upload URLs in the actions.
-      return NextResponse.json({ success: true, actions: object.actions });
-    }
-
-    if (action === "upload_chunk") {
-      // Step 2: Proxy the chunk to S3.
-      // This is slightly tricky if the chunk comes as JSON.
-      // But the client will send chunk as a blob in a separate request.
-      // Wait, we can just return the S3 URL to the client and let them upload DIRECTLY if possible?
-      // No, the requirement is to "Send chunks sequentially to the Next.js API route".
-      // So we must proxy.
-
-      // We need to handle binary data here.
-      // Re-fetching the POST as formData or arrayBuffer.
-      return NextResponse.json({ error: "Use binary endpoint for chunks" }, { status: 400 });
+      // Return the actions and the unique filename
+      return NextResponse.json({
+        success: true,
+        actions: object.actions,
+        uniqueFilename
+      });
     }
 
     return NextResponse.json({ error: "Invalid action" }, { status: 400 });
@@ -66,7 +59,7 @@ export async function POST(req: Request) {
   }
 }
 
-// Separate handler for binary chunk proxy
+// Proxy for uploading a part to S3
 export async function PUT(req: Request) {
   const url = req.headers.get("x-upload-url");
   if (!url) return NextResponse.json({ error: "Missing upload URL" }, { status: 400 });
@@ -79,7 +72,7 @@ export async function PUT(req: Request) {
     });
 
     if (!response.ok) {
-      throw new Error(`S3 upload failed: ${response.statusText}`);
+      throw new Error(`S3 part upload failed: ${response.statusText}`);
     }
 
     return NextResponse.json({ success: true });
@@ -88,13 +81,26 @@ export async function PUT(req: Request) {
   }
 }
 
-// Handler for commit
+// Finalize and Commit
 export async function PATCH(req: Request) {
-  const { filename, sha256, size } = await req.json();
-  if (!HF_TOKEN || !REPO_ID) return NextResponse.json({ error: "Config error" }, { status: 500 });
+  const body = await req.json();
+  const { filename, uniqueFilename, sha256, size, completeUrl } = body;
 
   try {
-    // Commit to HF via the 'create commit' API
+    // 1. Complete the LFS multipart upload if a completeUrl was provided
+    if (completeUrl) {
+      const compRes = await fetch(completeUrl, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${HF_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({}),
+      });
+      if (!compRes.ok) throw new Error("Failed to complete LFS multipart upload");
+    }
+
+    // 2. Commit the LFS pointer to the Git repository
     const response = await fetch(`https://huggingface.co/api/datasets/${REPO_ID}/commit/main`, {
       method: "POST",
       headers: {
@@ -106,8 +112,9 @@ export async function PATCH(req: Request) {
         operations: [
           {
             action: "add",
-            path: filename,
-            content: `version https://git-lfs.github.com/spec/v1\noid sha256:${sha256}\nsize ${size}\n`,
+            path: uniqueFilename, // Use the unique filename here
+            content: btoa(`version https://git-lfs.github.com/spec/v1\noid sha256:${sha256}\nsize ${size}\n`),
+            encoding: "base64",
           },
         ],
       }),
@@ -120,7 +127,7 @@ export async function PATCH(req: Request) {
 
     const protocol = req.headers.get("x-forwarded-proto") || "http";
     const host = req.headers.get("host");
-    const downloadUrl = `${protocol}://${host}/api/download/${filename}`;
+    const downloadUrl = `${protocol}://${host}/api/download/${uniqueFilename}`;
 
     return NextResponse.json({ success: true, downloadUrl });
   } catch (error: any) {

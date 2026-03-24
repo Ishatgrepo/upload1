@@ -26,14 +26,11 @@ export async function GET(
       return NextResponse.json({ error: "File not found or access denied" }, { status: response.status });
     }
 
-    // Proxy the response
-    const data = response.body;
+    // Pass along headers, set download disposition
     const headers = new Headers(response.headers);
+    headers.set("Content-Disposition", `attachment; filename="${filename.split("-").slice(1).join("-")}"`);
 
-    // Ensure it's treated as a download
-    headers.set("Content-Disposition", `attachment; filename="${filename}"`);
-
-    return new Response(data, {
+    return new Response(response.body, {
       status: 200,
       headers,
     });
